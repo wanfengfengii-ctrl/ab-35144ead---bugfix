@@ -147,13 +147,23 @@ export async function adjudicate(pool, cmd) {
 
     let chosenDigest = null;
     if (cmd.decision.type === 'select') {
+      // Compacted committed history: the checkpoint at this sequence attests
+      // the committed digest even though the event row itself is deleted.
+      const cp = await client.query(
+        'SELECT digest FROM checkpoints WHERE device_id=$1 AND sequence=$2',
+        [cmd.deviceId, cmd.sequence]
+      );
+      const committedDigest = cp.rows.length ? cp.rows[0].digest : null;
+
       const cand = await client.query(
         `SELECT 1 FROM event_records
           WHERE device_id=$1 AND sequence=$2 AND digest=$3
             AND status IN ('staged','visible')`,
         [cmd.deviceId, cmd.sequence, cmd.decision.digest]
       );
-      if (cand.rows.length === 0) {
+      // The checkpoint-attested digest is always selectable: confirming
+      // committed history needs no live candidate row.
+      if (cand.rows.length === 0 && cmd.decision.digest !== committedDigest) {
         throw errors.notFound(
           'selected digest is not a current candidate at this sequence',
           { deviceId: cmd.deviceId, sequence: cmd.sequence, digest: cmd.decision.digest }
@@ -180,6 +190,15 @@ export async function adjudicate(pool, cmd) {
           'CANNOT_REPLACE_VISIBLE_EVENT',
           'sequence is already part of the consecutive prefix; a different event cannot be selected',
           { deviceId: cmd.deviceId, sequence: cmd.sequence, visibleDigest: vis.rows[0].digest }
+        );
+      }
+      // Compacted history is equally immutable: at a checkpointed sequence the
+      // checkpoint-attested digest is the only selectable one.
+      if (committedDigest !== null && committedDigest !== cmd.decision.digest) {
+        throw errors.conflict(
+          'CANNOT_REPLACE_VISIBLE_EVENT',
+          'sequence is covered by a compaction checkpoint; committed history cannot be rewritten',
+          { deviceId: cmd.deviceId, sequence: cmd.sequence, checkpointDigest: committedDigest }
         );
       }
       chosenDigest = cmd.decision.digest;

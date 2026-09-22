@@ -288,6 +288,74 @@ async function main() {
     check('resumed read returns exactly the retained tail', resumed.status === 200 && resumed.json.events.map((e) => e.sequence).join() === '7,8,9,10,11,12');
   });
 
+  await group('compaction to the watermark: continuation and committed-history arbitration', async () => {
+    const d10 = 'acc-cpw-' + Math.random().toString(36).slice(2, 8);
+    const s10 = new Signer();
+    await api('POST', '/v1/devices', { body: { deviceId: d10, publicKey: s10.publicB64Url } });
+    const c10 = chain(s10, d10, 3);
+    await api('POST', `/v1/devices/${d10}/ingest`, { body: { requestId: rid(), events: c10.map((x) => x.event) } });
+
+    // Compact exactly up to the current watermark: the whole visible prefix
+    // collapses into a checkpoint attesting event 3's digest.
+    const compact = await api('POST', '/v1/admin/compact', {
+      admin: true,
+      body: { deviceId: d10, commandId: 'cpw-' + rid(), cutoffSequence: 3 },
+    });
+    check('manual checkpoint at the watermark', compact.status === 200 && compact.json.checkpoint.sequence === 3);
+    check('checkpoint attests the cutoff event digest', compact.json.checkpoint.digest === c10[2].digest);
+
+    // A legal continuation linking to the checkpoint digest must advance.
+    const e4 = s10.event({
+      deviceId: d10, sequence: 4, eventId: 'e4-post-cp', occurredAt: '2026-01-01T00:03:00Z',
+      keyVersion: 1, prevDigest: compact.json.checkpoint.digest, payload: { post: 'checkpoint' },
+    });
+    const cont = await api('POST', `/v1/devices/${d10}/ingest`, { body: { requestId: rid(), events: [e4.event] } });
+    check('legal continuation across the checkpoint advances to 4',
+      cont.status === 200 && cont.json.highWatermark === 4 && cont.json.conflicts.length === 0);
+
+    // Identical retransmission of the compacted event: conflict-free no-op.
+    const again = await api('POST', `/v1/devices/${d10}/ingest`, { body: { requestId: rid(), events: [c10[2].event] } });
+    check('identical retransmission of a compacted event is a no-op',
+      again.status === 200 && again.json.highWatermark === 4 && again.json.conflicts.length === 0 && again.json.events[0].state === 'visible');
+
+    // A divergent fork at the compacted sequence: queryable conflict, and the
+    // live chain is not blocked by it.
+    const fork3 = s10.event({ ...c10[2].event, payload: { rewritten: true } });
+    const forkRes = await api('POST', `/v1/devices/${d10}/ingest`, { body: { requestId: rid(), events: [fork3.event] } });
+    check('fork of compacted history opens post_visibility_divergence',
+      forkRes.json.conflicts?.[0]?.sequence === 3 && forkRes.json.conflicts[0].reason === 'post_visibility_divergence');
+    const listed = await api('GET', `/v1/devices/${d10}/conflicts?status=open`);
+    const forkConflict = listed.json.conflicts.find((c) => c.sequence === 3);
+    check('historical fork conflict is queryable', !!forkConflict && forkConflict.reason === 'post_visibility_divergence');
+
+    const e5 = s10.event({
+      deviceId: d10, sequence: 5, eventId: 'e5-post-cp', occurredAt: '2026-01-01T00:04:00Z',
+      keyVersion: 1, prevDigest: e4.digest, payload: {},
+    });
+    const cont5 = await api('POST', `/v1/devices/${d10}/ingest`, { body: { requestId: rid(), events: [e5.event] } });
+    check('live chain keeps advancing past the historical fork', cont5.json.highWatermark === 5);
+
+    // The committed digest cannot be replaced; the fork can only be refused.
+    const selectFork = await api('POST', `/v1/devices/${d10}/conflicts/3/adjudicate`, {
+      admin: true,
+      body: { deviceId: d10, sequence: 3, commandId: rid(), expectedConflictRevision: forkConflict.revision, decision: { type: 'select', digest: fork3.digest } },
+    });
+    check('selecting the fork digest is refused', selectFork.status === 409 && selectFork.json.error.code === 'CANNOT_REPLACE_VISIBLE_EVENT');
+    const rej = await api('POST', `/v1/devices/${d10}/conflicts/3/adjudicate`, {
+      admin: true,
+      body: { deviceId: d10, sequence: 3, commandId: rid(), expectedConflictRevision: forkConflict.revision, decision: { type: 'reject_all' } },
+    });
+    check('reject_all resolves the historical fork', rej.status === 200 && rej.json.highWatermark === 5);
+    const resolved = await api('GET', `/v1/devices/${d10}/conflicts/3`);
+    check('resolved conflict remains queryable', resolved.json.status === 'resolved' && resolved.json.resolution === 'rejected_all');
+
+    // Reads: behind the checkpoint is 410; the tail reads consecutively.
+    const behind = await api('GET', `/v1/devices/${d10}/events`);
+    check('read behind the checkpoint is 410', behind.status === 410);
+    const tail = await api('GET', `/v1/devices/${d10}/events?afterSequence=3`);
+    check('tail after the checkpoint reads 4,5', tail.status === 200 && tail.json.events.map((e) => e.sequence).join() === '4,5');
+  });
+
   await group('background worker compaction', async () => {
     const d9 = 'acc-bg-' + Math.random().toString(36).slice(2, 8);
     const s9 = new Signer();

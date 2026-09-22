@@ -6,8 +6,10 @@
 //  * the cutoff never crosses the earliest event an unexpired fixed view can
 //    still read;
 //  * the checkpoint row (device, cutoff digest, generatedAt, server signature,
-//    hash link to the previous checkpoint) and the DELETE commit atomically,
-//    so an event can never be both unreadable and uncovered;
+//    hash link to the previous checkpoint), the per-sequence digest tombstones
+//    and the DELETE commit atomically, so an event can never be both
+//    unreadable and uncovered, and the compacted prefix keeps anchoring chain
+//    advancement and conflict detection as immutable committed history;
 //  * cutoff strictly advances the latest checkpoint, whose stored digest is
 //    re-read to prove the new checkpoint extends the real visible prefix;
 //  * a per-device transaction advisory lock makes concurrent worker/manual
@@ -165,6 +167,18 @@ export async function compactDevice(pool, serverKey, cfg, deviceId, desiredCutof
         deviceId, safeCutoff, cutoffDigest, prevCheckpointDigest,
         generatedAt, Buffer.from(cp.signature, 'base64url'),
       ]
+    );
+
+    // Preserve the committed digests as tombstones in the same transaction:
+    // the deleted prefix keeps anchoring chain advancement and conflict
+    // detection as immutable committed history. Idempotent by primary key,
+    // exactly like the checkpoint insert above.
+    await client.query(
+      `INSERT INTO compacted_events (device_id, sequence, digest)
+         SELECT device_id, sequence, digest FROM event_records
+          WHERE device_id=$1 AND status='visible' AND sequence <= $2
+         ON CONFLICT (device_id, sequence) DO NOTHING`,
+      [deviceId, safeCutoff]
     );
 
     const deleted = await client.query(

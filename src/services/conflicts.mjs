@@ -39,6 +39,7 @@ export async function listConflicts(pool, deviceId, { status = 'open', limit = 1
   );
   const seqs = rows.map((r) => Number(r.sequence));
   let candidates = [];
+  const committedBySeq = new Map();
   if (seqs.length) {
     const { rows: candRows } = await pool.query(
       `SELECT sequence, digest, event_id, occurred_at, key_version, prev_digest,
@@ -49,6 +50,25 @@ export async function listConflicts(pool, deviceId, { status = 'open', limit = 1
       [deviceId, seqs]
     );
     candidates = candRows.map(candidateRow);
+    // The immutable committed digest at each conflicted sequence, if any: the
+    // visible row, else the compacted tombstone, else the covering checkpoint.
+    // Exposed so an operator can confirm committed history even after the
+    // event itself was compacted away.
+    const { rows: committedRows } = await pool.query(
+      `SELECT DISTINCT ON (sequence) sequence, digest FROM (
+         SELECT sequence, digest, 1 AS prio FROM event_records
+          WHERE device_id=$1 AND sequence = ANY($2::bigint[]) AND status='visible'
+         UNION ALL
+         SELECT sequence, digest, 2 AS prio FROM compacted_events
+          WHERE device_id=$1 AND sequence = ANY($2::bigint[])
+         UNION ALL
+         SELECT sequence, digest, 3 AS prio FROM checkpoints
+          WHERE device_id=$1 AND sequence = ANY($2::bigint[])
+       ) committed
+       ORDER BY sequence, prio`,
+      [deviceId, seqs]
+    );
+    for (const r of committedRows) committedBySeq.set(Number(r.sequence), r.digest);
   }
   const bySeq = new Map();
   for (const c of candidates) {
@@ -65,6 +85,7 @@ export async function listConflicts(pool, deviceId, { status = 'open', limit = 1
       resolution: r.resolution,
       chosenDigest: r.chosen_digest,
       decidedCommandId: r.decided_command_id,
+      committedDigest: committedBySeq.get(Number(r.sequence)) ?? null,
       createdAt: r.created_at.toISOString(),
       resolvedAt: r.resolved_at ? r.resolved_at.toISOString() : null,
       candidates: bySeq.get(Number(r.sequence)) || [],
@@ -147,10 +168,21 @@ export async function adjudicate(pool, cmd) {
 
     let chosenDigest = null;
     if (cmd.decision.type === 'select') {
+      // The chosen digest must be a live candidate OR the immutable committed
+      // digest itself (visible row, compacted tombstone or checkpoint): after
+      // compaction the committed event row is gone, but confirming its digest
+      // must stay possible.
       const cand = await client.query(
         `SELECT 1 FROM event_records
           WHERE device_id=$1 AND sequence=$2 AND digest=$3
-            AND status IN ('staged','visible')`,
+            AND status IN ('staged','visible')
+         UNION ALL
+         SELECT 1 FROM compacted_events
+          WHERE device_id=$1 AND sequence=$2 AND digest=$3
+         UNION ALL
+         SELECT 1 FROM checkpoints
+          WHERE device_id=$1 AND sequence=$2 AND digest=$3
+         LIMIT 1`,
         [cmd.deviceId, cmd.sequence, cmd.decision.digest]
       );
       if (cand.rows.length === 0) {
@@ -167,19 +199,27 @@ export async function adjudicate(pool, cmd) {
             AND status <> 'visible'`,
         [cmd.deviceId, cmd.sequence, cmd.decision.digest]
       );
-      // If a visible event already exists here (post-visibility divergence),
-      // selecting a different candidate is forbidden: the prefix cannot be
-      // rewritten. Selecting the visible digest simply resolves the conflict.
-      const vis = await client.query(
-        `SELECT digest FROM event_records
-          WHERE device_id=$1 AND sequence=$2 AND status='visible'`,
+      // If a committed event already exists here (visible or compacted into a
+      // checkpoint), selecting a different candidate is forbidden: the
+      // committed prefix cannot be rewritten. Selecting the committed digest
+      // simply resolves the conflict.
+      const committed = await client.query(
+        `SELECT digest, 1 AS prio FROM event_records
+          WHERE device_id=$1 AND sequence=$2 AND status='visible'
+         UNION ALL
+         SELECT digest, 2 AS prio FROM compacted_events
+          WHERE device_id=$1 AND sequence=$2
+         UNION ALL
+         SELECT digest, 3 AS prio FROM checkpoints
+          WHERE device_id=$1 AND sequence=$2
+         ORDER BY prio LIMIT 1`,
         [cmd.deviceId, cmd.sequence]
       );
-      if (vis.rows.length && vis.rows[0].digest !== cmd.decision.digest) {
+      if (committed.rows.length && committed.rows[0].digest !== cmd.decision.digest) {
         throw errors.conflict(
           'CANNOT_REPLACE_VISIBLE_EVENT',
           'sequence is already part of the consecutive prefix; a different event cannot be selected',
-          { deviceId: cmd.deviceId, sequence: cmd.sequence, visibleDigest: vis.rows[0].digest }
+          { deviceId: cmd.deviceId, sequence: cmd.sequence, visibleDigest: committed.rows[0].digest }
         );
       }
       chosenDigest = cmd.decision.digest;

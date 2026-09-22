@@ -138,8 +138,29 @@ export async function ingestBatch(pool, batch) {
       }
 
       // ---- Phase 2: persist candidates (all validation already passed) ----
+      // Sequences already committed AND compacted are immutable history: an
+      // identical retransmission collapses onto the digest tombstone as a
+      // no-op (reported as 'compacted'), while a different digest is staged
+      // as fork evidence and reconciled against the committed digest below.
+      // The devices row lock held by this transaction serializes against
+      // compaction, so the tombstone view read here cannot change underneath.
+      const preparedSeqs = [...new Set(prepared.map((p) => p.sequence))];
+      const { rows: tombRows } = await client.query(
+        `SELECT sequence, digest FROM compacted_events
+          WHERE device_id=$1 AND sequence = ANY($2::bigint[])`,
+        [deviceId, preparedSeqs]
+      );
+      const compactedDigestBySeq = new Map(tombRows.map((r) => [Number(r.sequence), r.digest]));
+
       const affectedSeqs = new Map(); // seq -> addedNewDigest?
+      const compactedNoop = new Set(); // digests of identical retransmissions
       for (const p of prepared) {
+        const committed = compactedDigestBySeq.get(p.sequence);
+        if (committed !== undefined && committed === p.digest) {
+          compactedNoop.add(p.digest);
+          continue;
+        }
+
         const before = await client.query(
           `SELECT status FROM event_records
             WHERE device_id=$1 AND sequence=$2 AND digest=$3`,
@@ -191,7 +212,7 @@ export async function ingestBatch(pool, batch) {
       const accepted = prepared.map((p) => ({
         sequence: p.sequence,
         digest: p.digest,
-        state: stateByDigest.get(p.digest),
+        state: compactedNoop.has(p.digest) ? 'compacted' : stateByDigest.get(p.digest),
       }));
 
       const { rows: conflictRows } = await client.query(

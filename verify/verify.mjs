@@ -288,6 +288,66 @@ async function main() {
     check('resumed read returns exactly the retained tail', resumed.status === 200 && resumed.json.events.map((e) => e.sequence).join() === '7,8,9,10,11,12');
   });
 
+  await group('compaction to the watermark keeps the committed prefix as anchor', async () => {
+    const d10 = 'acc-anchor-' + Math.random().toString(36).slice(2, 8);
+    const s10 = new Signer();
+    await api('POST', '/v1/devices', { body: { deviceId: d10, publicKey: s10.publicB64Url } });
+    const c10 = chain(s10, d10, 3);
+    await api('POST', `/v1/devices/${d10}/ingest`, { body: { requestId: rid(), events: c10.map((x) => x.event) } });
+
+    const compact = await api('POST', '/v1/admin/compact', {
+      admin: true,
+      body: { deviceId: d10, commandId: 'cp-' + rid(), cutoffSequence: 3 },
+    });
+    check('manual checkpoint exactly at the watermark', compact.status === 200 && compact.json.checkpoint.sequence === 3);
+
+    // Legal continuation: seq 4 links to the checkpoint digest of seq 3.
+    const e4 = s10.event({
+      deviceId: d10, sequence: 4, eventId: 'e4', occurredAt: '2026-03-01T00:00:00Z',
+      keyVersion: 1, prevDigest: c10[2].digest, payload: { cont: true },
+    });
+    const cont = await api('POST', `/v1/devices/${d10}/ingest`, { body: { requestId: rid(), events: [e4.event] } });
+    check('continuation linked to the checkpoint digest advances the watermark',
+      cont.status === 200 && cont.json.highWatermark === 4 && cont.json.conflicts.length === 0);
+
+    // Identical retransmission of compacted events: idempotent no-op, no conflict.
+    const again = await api('POST', `/v1/devices/${d10}/ingest`, { body: { requestId: rid(), events: [c10[2].event] } });
+    check('identical retransmission at the checkpoint sequence is a no-op',
+      again.status === 200 && again.json.highWatermark === 4 && again.json.conflicts.length === 0);
+    const againBelow = await api('POST', `/v1/devices/${d10}/ingest`, { body: { requestId: rid(), events: [c10[0].event, c10[1].event] } });
+    check('identical retransmission below the checkpoint is a no-op',
+      againBelow.status === 200 && againBelow.json.conflicts.length === 0);
+
+    // A different digest at a compacted sequence: queryable conflict, never a
+    // candidate that could rewrite committed history.
+    const fork3 = s10.event({
+      deviceId: d10, sequence: 3, eventId: 'e3-fork', occurredAt: '2026-01-01T00:03:00Z',
+      keyVersion: 1, prevDigest: c10[1].digest, payload: { fork: 3 },
+    });
+    const fr = await api('POST', `/v1/devices/${d10}/ingest`, { body: { requestId: rid(), events: [fork3.event] } });
+    check('fork at a compacted sequence opens post_visibility_divergence',
+      fr.status === 200 && fr.json.highWatermark === 4 && fr.json.conflicts?.[0]?.reason === 'post_visibility_divergence');
+    const cfl = await api('GET', `/v1/devices/${d10}/conflicts/3`);
+    check('conflict is queryable and exposes the committed digest',
+      cfl.status === 200 && cfl.json.committedDigest === c10[2].digest);
+
+    const replace = await api('POST', `/v1/devices/${d10}/conflicts/3/adjudicate`, {
+      admin: true,
+      body: { deviceId: d10, sequence: 3, commandId: rid(), expectedConflictRevision: cfl.json.revision, decision: { type: 'select', digest: fork3.digest } },
+    });
+    check('committed history cannot be replaced by adjudication',
+      replace.status === 409 && replace.json.error.code === 'CANNOT_REPLACE_VISIBLE_EVENT');
+
+    const confirm = await api('POST', `/v1/devices/${d10}/conflicts/3/adjudicate`, {
+      admin: true,
+      body: { deviceId: d10, sequence: 3, commandId: rid(), expectedConflictRevision: cfl.json.revision, decision: { type: 'select', digest: c10[2].digest } },
+    });
+    check('confirming the committed digest resolves the conflict',
+      confirm.status === 200 && confirm.json.resolution === 'selected' && confirm.json.highWatermark === 4);
+    const open = await api('GET', `/v1/devices/${d10}/conflicts?status=open`);
+    check('no open conflicts remain', open.status === 200 && open.json.conflicts.length === 0);
+  });
+
   await group('background worker compaction', async () => {
     const d9 = 'acc-bg-' + Math.random().toString(36).slice(2, 8);
     const s9 = new Signer();

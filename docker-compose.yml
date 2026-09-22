@@ -1,0 +1,141 @@
+# Full acceptance topology:
+#   db (PostgreSQL, the sole arbitration authority)
+#   api1 + api2 (two identical API instances)
+#   worker (independent background compaction task)
+#   proxy (nginx round-robin; the ONLY port published to the host)
+#   verify (one-shot acceptance service; run via `docker compose run --rm verify`)
+#
+# The single host port is overridable with API_PORT, e.g. API_PORT=9090 docker compose up.
+
+name: telemetry-sequence
+
+x-api-env: &api-env
+  DATABASE_HOST: db
+  DATABASE_PORT: "5432"
+  DATABASE_NAME: telemetry
+  DATABASE_USER: telemetry
+  DATABASE_PASSWORD: telemetry
+  DATABASE_POOL_SIZE: "10"
+  ADMIN_TOKEN: acceptance-admin-token
+  # base64url of a shared 32-byte Ed25519 seed (identical on every instance/worker)
+  CHECKPOINT_SIGNING_KEY: c2hhcmVkLXByb2QtY2hlY2twb2ludC1zZWVkLTMyISE
+  REQUEST_SIZE_LIMIT: "16777216"
+  WAIT_TIMEOUT: 30s
+  VIEW_TTL: 5m
+  COMPACTION_RETENTION_EVENTS: "10"
+  COMPACTION_MIN_EVENTS: "5"
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: telemetry
+      POSTGRES_USER: telemetry
+      POSTGRES_PASSWORD: telemetry
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U telemetry -d telemetry"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    # No host port is published: the database is reachable only on the compose
+    # network, reinforcing that it is the single private arbitration store.
+
+  api1:
+    build: .
+    image: telemetry-service:local
+    environment:
+      <<: *api-env
+      ROLE: api1
+      COMPACTION_INTERVAL: 2s
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  api2:
+    image: telemetry-service:local
+    build: .
+    environment:
+      <<: *api-env
+      ROLE: api2
+      COMPACTION_INTERVAL: 2s
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  worker:
+    image: telemetry-service:local
+    build:
+      context: .
+    command: ["node", "src/bin/worker.js"]
+    environment:
+      <<: *api-env
+      ROLE: worker
+      COMPACTION_INTERVAL: 2s
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  proxy:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "${API_PORT:-8080}:80"
+    depends_on:
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  verify:
+    image: telemetry-service:local
+    build:
+      context: .
+    command: ["node", "verify/verify.mjs"]
+    profiles: ["acceptance"]
+    environment:
+      BASE_URL: http://proxy
+      ADMIN_TOKEN: acceptance-admin-token
+      # Must match the API/worker key so checkpoints verify.
+      CHECKPOINT_SIGNING_KEY: c2hhcmVkLXByb2QtY2hlY2twb2ludC1zZWVkLTMyISE
+      DATABASE_HOST: db
+      DATABASE_NAME: telemetry
+      DATABASE_USER: telemetry
+      DATABASE_PASSWORD: telemetry
+      COMPACTION_RETENTION_EVENTS: "10"
+      COMPACTION_MIN_EVENTS: "5"
+    depends_on:
+      db:
+        condition: service_healthy
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+      worker:
+        condition: service_started
+      proxy:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  db-data:

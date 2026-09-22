@@ -1,0 +1,22 @@
+{
+  "name": "telemetry-sequence-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Industrial edge telemetry sequencing service with hash chains, Ed25519 signatures, conflict adjudication, fixed-view reads and history compaction",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "start": "node src/bin/api.js",
+    "worker": "node src/bin/worker.js",
+    "test": "node --test \"test/**/*.test.mjs\"",
+    "vector": "node examples/generate-vector.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "embedded-postgres": "17.10.0-beta.17"
+  }
+}
